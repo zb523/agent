@@ -9,7 +9,7 @@ import asyncio
 import os
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import pyaudio
@@ -34,7 +34,19 @@ if not os.getenv("OPENAI_API_KEY"):
 # OpenAI client
 openai_client = AsyncOpenAI()
 
-# Constants
+# =============================================================================
+# Language Configuration (mirrors agent.py)
+# =============================================================================
+INPUT_LANGUAGE = "en"
+OUTPUT_LANGUAGES = ["es", "fr", "ar"]
+LANG_NAMES = {
+    "en": "English",
+    "es": "Spanish",
+    "fr": "French",
+    "ar": "Arabic",
+}
+
+# Buffer configuration
 PUNCTUATION = re.compile(r'[.!?,;:]')
 MIN_WORDS = 5
 SAMPLE_RATE = 48000
@@ -51,9 +63,9 @@ class TranscriptBuffer:
     processed, and only look at uncommitted text for new commits.
     """
     pair_id: int = 1
-    full_text: str = ""           # Full cumulative transcript from Speechmatics
-    committed_idx: int = 0        # Position we've committed up to
-    last_published_text: str = "" # Last uncommitted text published (for dedup)
+    full_text: str = ""
+    committed_idx: int = 0
+    last_published_text: str = ""
     
     @property
     def uncommitted(self) -> str:
@@ -85,8 +97,6 @@ class TranscriptBuffer:
         uncommitted = self.uncommitted
         committed = uncommitted[:idx].strip()
         
-        # Calculate how much to advance committed_idx
-        # Account for any whitespace we stripped with lstrip()
         raw_uncommitted = self.full_text[self.committed_idx:]
         lstrip_offset = len(raw_uncommitted) - len(raw_uncommitted.lstrip())
         self.committed_idx += lstrip_offset + idx
@@ -94,36 +104,45 @@ class TranscriptBuffer:
         return committed
 
 
-async def translate_to_spanish(text: str) -> str:
-    """Translate text to Spanish using OpenAI."""
+# =============================================================================
+# Translation (GPT-4.1)
+# =============================================================================
+async def translate_text(text: str, target_lang: str) -> str:
+    """Translate text to target language using GPT-4.1."""
     response = await openai_client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4.1",
         messages=[
-            {"role": "system", "content": "Translate to Spanish. Return only the translation."},
+            {"role": "system", "content": f"Translate to {LANG_NAMES[target_lang]}. Return only the translation, nothing else."},
             {"role": "user", "content": text}
         ],
     )
     return response.choices[0].message.content.strip()
 
 
-def publish_to_room(pair_id: int, text: str, status: str, msg_type: str, original: str = None):
-    """Simulate publishing to room."""
+# =============================================================================
+# Mock Publishing (prints to console)
+# =============================================================================
+def publish_to_room(pair_id: int, text: str, status: str, msg_type: str, language: str, original: str = None):
+    """Simulate publishing to room (prints to console)."""
     if msg_type == "transcript":
         icon = "📝" if status == "incomplete" else "✅"
-        print(f"  {icon} [{status.upper()}] pair={pair_id}: {text}")
+        print(f"  {icon} [{status.upper()}] pair={pair_id} lang={language}: {text}")
     else:
-        print(f"  🌐 [TRANSLATED] pair={pair_id}: {text}")
+        lang_emoji = {"es": "🇪🇸", "fr": "🇫🇷", "ar": "🇸🇦"}.get(language, "🌐")
+        print(f"  {lang_emoji} [TRANSLATED] pair={pair_id} lang={language}: {text}")
         if original:
-            print(f"     (original: {original})")
+            print(f"       (original: {original})")
 
 
-async def handle_translation(text: str, pair_id: int):
-    """Translate and publish."""
+async def handle_translation(text: str, pair_id: int, target_lang: str):
+    """Translate to a single language and print result."""
     try:
-        translation = await translate_to_spanish(text)
-        publish_to_room(pair_id, translation, "complete", "translation", original=text)
+        translation = await translate_text(text, target_lang)
+        publish_to_room(pair_id, translation, "complete", "translation", target_lang, original=text)
+        # Note: In agent.py, TTS would be called here. For local test, we just print.
+        print(f"       [TTS skipped locally for {target_lang}]")
     except Exception as e:
-        print(f"  ❌ Translation failed: {e}")
+        print(f"  ❌ Translation to {target_lang} failed: {e}")
 
 
 async def run():
@@ -131,17 +150,19 @@ async def run():
     pending_translations = []
     
     print("\n" + "=" * 80)
-    print("LOCAL TRANSCRIPTION + TRANSLATION TEST")
+    print("LOCAL TRANSCRIPTION + MULTI-LANGUAGE TRANSLATION TEST")
     print("=" * 80)
     print(f"Using LiveKit Speechmatics STT plugin (same as agent.py)")
     print(f"Buffer: MIN_WORDS={MIN_WORDS}, punctuation: . ! ? , ; :")
-    print("Speak in English -> Translated to Spanish")
+    print(f"Input: {INPUT_LANGUAGE} ({LANG_NAMES[INPUT_LANGUAGE]})")
+    print(f"Output: {', '.join(f'{lang} ({LANG_NAMES[lang]})' for lang in OUTPUT_LANGUAGES)}")
+    print("Translation model: GPT-4.1")
     print("Press Ctrl+C to stop")
     print("=" * 80 + "\n")
 
     # Create STT
     stt = speechmatics.STT(
-        language="en",
+        language=INPUT_LANGUAGE,
         enable_partials=True,
         end_of_utterance_mode=EndOfUtteranceMode.NONE,
     )
@@ -190,36 +211,32 @@ async def run():
                     if not text:
                         continue
                     
-                    # Update full cumulative text
                     buffer.full_text = text
-                    
-                    # Get uncommitted portion only
                     uncommitted = buffer.uncommitted
                     
-                    # Publish if uncommitted text changed (dedup)
+                    # Publish if uncommitted text changed
                     if uncommitted and uncommitted != buffer.last_published_text:
-                        publish_to_room(buffer.pair_id, uncommitted, "incomplete", "transcript")
+                        publish_to_room(buffer.pair_id, uncommitted, "incomplete", "transcript", INPUT_LANGUAGE)
                         buffer.last_published_text = uncommitted
                     
-                    # Check for commit point in uncommitted text
+                    # Check for commit
                     if buffer.find_commit_point():
                         committed = buffer.commit()
                         if committed:
-                            # Publish complete
-                            publish_to_room(buffer.pair_id, committed, "complete", "transcript")
+                            # Publish complete transcript
+                            publish_to_room(buffer.pair_id, committed, "complete", "transcript", INPUT_LANGUAGE)
                             
-                            # Translate async
-                            task = asyncio.create_task(handle_translation(committed, buffer.pair_id))
-                            pending_translations.append(task)
+                            # Parallel translation to all output languages
+                            for lang in OUTPUT_LANGUAGES:
+                                task = asyncio.create_task(
+                                    handle_translation(committed, buffer.pair_id, lang)
+                                )
+                                pending_translations.append(task)
                             
-                            # Advance pair_id for next chunk
                             old = buffer.pair_id
                             buffer.pair_id += 1
                             buffer.last_published_text = ""
-                            
-                            # Show new uncommitted after commit
-                            new_uncommitted = buffer.uncommitted
-                            print(f"  🔄 ROLLOVER: {old} -> {buffer.pair_id}, new uncommitted='{new_uncommitted}'")
+                            print(f"  🔄 ROLLOVER: {old} -> {buffer.pair_id}")
                             
             elif event.type == SpeechEventType.FINAL_TRANSCRIPT:
                 if event.alternatives:
@@ -255,7 +272,7 @@ async def run():
         uncommitted = buffer.uncommitted
         if uncommitted and uncommitted != buffer.last_published_text:
             print("Flushing incomplete buffer:")
-            publish_to_room(buffer.pair_id, uncommitted, "incomplete", "transcript")
+            publish_to_room(buffer.pair_id, uncommitted, "incomplete", "transcript", INPUT_LANGUAGE)
         
         await stt_stream.aclose()
         mic_stream.stop_stream()

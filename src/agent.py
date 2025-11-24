@@ -8,7 +8,7 @@ from openai import AsyncOpenAI
 from livekit import rtc
 from livekit.agents import AgentServer, JobContext, cli
 from livekit.agents.stt import SpeechEventType
-from livekit.plugins import speechmatics
+from livekit.plugins import speechmatics, cartesia
 from livekit.plugins.speechmatics import EndOfUtteranceMode
 
 logger = logging.getLogger("transcription-agent")
@@ -23,7 +23,19 @@ load_dotenv(".env.local")
 # OpenAI client for translation
 openai_client = AsyncOpenAI()
 
-# Constants
+# =============================================================================
+# Language Configuration
+# =============================================================================
+INPUT_LANGUAGE = "en"
+OUTPUT_LANGUAGES = ["es", "fr", "ar"]
+LANG_NAMES = {
+    "en": "English",
+    "es": "Spanish", 
+    "fr": "French", 
+    "ar": "Arabic",
+}
+
+# Buffer configuration
 PUNCTUATION = re.compile(r'[.!?,;:]')
 MIN_WORDS = 5
 
@@ -40,9 +52,9 @@ class TranscriptBuffer:
     processed, and only look at uncommitted text for new commits.
     """
     pair_id: int = 1
-    full_text: str = ""           # Full cumulative transcript from Speechmatics
-    committed_idx: int = 0        # Position we've committed up to
-    last_published_text: str = "" # Last uncommitted text published (for dedup)
+    full_text: str = ""
+    committed_idx: int = 0
+    last_published_text: str = ""
     
     @property
     def uncommitted(self) -> str:
@@ -74,8 +86,6 @@ class TranscriptBuffer:
         uncommitted = self.uncommitted
         committed = uncommitted[:idx].strip()
         
-        # Calculate how much to advance committed_idx
-        # Account for any whitespace we stripped with lstrip()
         raw_uncommitted = self.full_text[self.committed_idx:]
         lstrip_offset = len(raw_uncommitted) - len(raw_uncommitted.lstrip())
         self.committed_idx += lstrip_offset + idx
@@ -83,31 +93,75 @@ class TranscriptBuffer:
         return committed
 
 
-async def translate_to_spanish(text: str) -> str:
-    """Translate text to Spanish using OpenAI."""
+# =============================================================================
+# Translation (GPT-4.1)
+# =============================================================================
+async def translate_text(text: str, target_lang: str) -> str:
+    """Translate text to target language using GPT-4.1."""
     response = await openai_client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4.1",
         messages=[
-            {"role": "system", "content": "Translate to Spanish. Return only the translation, nothing else."},
+            {"role": "system", "content": f"Translate to {LANG_NAMES[target_lang]}. Return only the translation, nothing else."},
             {"role": "user", "content": text}
         ],
     )
     return response.choices[0].message.content.strip()
 
 
+# =============================================================================
+# TTS (Cartesia Sonic 3)
+# =============================================================================
+def create_tts(language: str) -> cartesia.TTS:
+    """Create a Cartesia TTS instance for the given language."""
+    return cartesia.TTS(
+        model="sonic-3",
+        language=language,
+    )
+
+
+async def synthesize_and_play(text: str, language: str, audio_source: rtc.AudioSource):
+    """Synthesize text to speech and play on the audio source."""
+    try:
+        tts = create_tts(language)
+        tts_stream = tts.stream()
+        tts_stream.push_text(text)
+        tts_stream.end_input()
+        
+        async for audio in tts_stream:
+            await audio_source.capture_frame(audio.frame)
+    except Exception as e:
+        logger.error(f"TTS synthesis failed for {language}: {e}")
+
+
+# =============================================================================
+# Main Agent
+# =============================================================================
 @server.rtc_session()
 async def transcription_agent(ctx: JobContext):
     """
-    Real-time transcription and translation agent using Speechmatics.
-    Subscribes to participant audio, transcribes, buffers until punctuation,
-    then translates to Spanish and publishes to room.
+    Real-time transcription and translation agent.
+    - Transcribes with Speechmatics
+    - Translates to multiple languages (es, fr, ar) with GPT-4.1
+    - Synthesizes audio with Cartesia Sonic 3
     """
     ctx.log_context_fields = {"room": ctx.room.name}
     logger.info(f"Transcription agent starting in room: {ctx.room.name}")
 
-    # Connect to room first
+    # Connect to room
     await ctx.connect()
     logger.info("Connected to room, waiting for participants...")
+
+    # ==========================================================================
+    # Create TTS audio tracks per output language
+    # ==========================================================================
+    audio_sources: dict[str, rtc.AudioSource] = {}
+    
+    for lang in OUTPUT_LANGUAGES:
+        source = rtc.AudioSource(24000, 1)  # Cartesia outputs 24kHz mono
+        track = rtc.LocalAudioTrack.create_audio_track(f"tts-{lang}", source)
+        await ctx.room.local_participant.publish_track(track)
+        audio_sources[lang] = source
+        logger.info(f"Published TTS audio track: tts-{lang}")
 
     # Track active transcription tasks
     active_tasks: dict[str, asyncio.Task] = {}
@@ -121,7 +175,7 @@ async def transcription_agent(ctx: JobContext):
         if track.kind == rtc.TrackKind.KIND_AUDIO:
             logger.info(f"Audio track subscribed from {participant.identity}")
             task = asyncio.create_task(
-                process_audio_track(ctx, track, participant)
+                process_audio_track(ctx, track, participant, audio_sources)
             )
             active_tasks[participant.identity] = task
 
@@ -143,7 +197,7 @@ async def transcription_agent(ctx: JobContext):
             if publication.track and publication.track.kind == rtc.TrackKind.KIND_AUDIO:
                 logger.info(f"Found existing audio track from {participant.identity}")
                 task = asyncio.create_task(
-                    process_audio_track(ctx, publication.track, participant)
+                    process_audio_track(ctx, publication.track, participant, audio_sources)
                 )
                 active_tasks[participant.identity] = task
 
@@ -161,34 +215,34 @@ async def process_audio_track(
     ctx: JobContext,
     track: rtc.RemoteTrack,
     participant: rtc.RemoteParticipant,
+    audio_sources: dict[str, rtc.AudioSource],
 ):
     """
-    Process audio from a participant, transcribe with Speechmatics,
-    buffer and translate to Spanish when commit conditions are met.
+    Process audio from a participant:
+    1. Transcribe with Speechmatics
+    2. Buffer until commit (5+ words + punctuation)
+    3. Translate to all output languages in parallel
+    4. Synthesize TTS for each translation
     """
     logger.info(f"Starting transcription for {participant.identity}")
 
-    # Create Speechmatics STT with partials enabled, EOU disabled (one-way pipeline)
+    # Speechmatics STT
     stt = speechmatics.STT(
-        language="en",
-        enable_partials=True,  # Critical: enables INTERIM_TRANSCRIPT events
-        end_of_utterance_mode=EndOfUtteranceMode.NONE,  # Disable EOU - one-way pipeline
+        language=INPUT_LANGUAGE,
+        enable_partials=True,
+        end_of_utterance_mode=EndOfUtteranceMode.NONE,
     )
 
     stt_stream = stt.stream()
     audio_stream = rtc.AudioStream(track)
-    
-    # Buffer for this participant
     buffer = TranscriptBuffer()
 
     async def push_audio():
-        """Push audio frames to STT stream."""
         async for audio_event in audio_stream:
             stt_stream.push_frame(audio_event.frame)
         stt_stream.end_input()
 
     async def process_stt_events():
-        """Process STT events with fixed buffer tracking."""
         nonlocal buffer
         
         async for event in stt_stream:
@@ -201,35 +255,34 @@ async def process_audio_track(
                     if not text:
                         continue
                     
-                    # Update full cumulative text
                     buffer.full_text = text
-                    
-                    # Get uncommitted portion only
                     uncommitted = buffer.uncommitted
                     
-                    # Publish if uncommitted text changed (dedup)
+                    # Publish incomplete transcript if changed
                     if uncommitted and uncommitted != buffer.last_published_text:
                         await publish_buffer(ctx, participant, buffer, status="incomplete")
                         buffer.last_published_text = uncommitted
                     
-                    # Check for commit point in uncommitted text
+                    # Check for commit
                     if buffer.find_commit_point():
                         committed = buffer.commit()
                         if committed:
                             # Publish complete transcript
                             await publish_complete(ctx, participant, committed, buffer.pair_id)
                             
-                            # Translate asynchronously (don't block)
-                            asyncio.create_task(
-                                translate_and_publish(ctx, participant, committed, buffer.pair_id)
-                            )
+                            # Parallel translation + TTS for all output languages
+                            for lang in OUTPUT_LANGUAGES:
+                                asyncio.create_task(
+                                    translate_and_publish(
+                                        ctx, participant, committed, buffer.pair_id, 
+                                        lang, audio_sources
+                                    )
+                                )
                             
-                            # Advance pair_id for next chunk
                             old_pair = buffer.pair_id
                             buffer.pair_id += 1
                             buffer.last_published_text = ""
-                            
-                            logger.info(f"🔄 ROLLOVER: {old_pair} -> {buffer.pair_id}, uncommitted='{buffer.uncommitted}'")
+                            logger.info(f"🔄 ROLLOVER: {old_pair} -> {buffer.pair_id}")
 
             elif event.type == SpeechEventType.FINAL_TRANSCRIPT:
                 if event.alternatives:
@@ -249,25 +302,25 @@ async def process_audio_track(
     except Exception as e:
         logger.exception(f"Error in transcription for {participant.identity}: {e}")
     finally:
-        # Handle stream end - publish incomplete buffer without translation
         uncommitted = buffer.uncommitted
         if uncommitted and uncommitted != buffer.last_published_text:
-            logger.info(f"📤 FLUSH incomplete buffer on stream end: '{uncommitted}'")
+            logger.info(f"📤 FLUSH incomplete buffer: '{uncommitted}'")
             await publish_buffer(ctx, participant, buffer, status="incomplete")
         
         await stt_stream.aclose()
         logger.info(f"Transcription ended for {participant.identity}")
 
 
+# =============================================================================
+# Publishing Functions
+# =============================================================================
 async def publish_buffer(
     ctx: JobContext,
     participant: rtc.RemoteParticipant,
     buffer: TranscriptBuffer,
     status: str,
 ):
-    """
-    Publish current uncommitted transcript to room.
-    """
+    """Publish current uncommitted transcript to room."""
     text = buffer.uncommitted
     if not text.strip():
         return
@@ -277,17 +330,15 @@ async def publish_buffer(
             "pair_id": str(buffer.pair_id),
             "status": status,
             "type": "transcript",
+            "language": INPUT_LANGUAGE,
             "participant_identity": participant.identity,
         }
-
         await ctx.room.local_participant.send_text(
-            text,
-            topic="lk.transcription",
-            attributes=attributes,
+            text, topic="lk.transcription", attributes=attributes
         )
-        logger.info(f"[{status.upper()}] pair={buffer.pair_id}: {text}")
+        logger.info(f"[{status.upper()}] pair={buffer.pair_id} lang={INPUT_LANGUAGE}: {text}")
     except Exception as e:
-        logger.error(f"❌ Failed to publish buffer: {e}")
+        logger.error(f"Failed to publish buffer: {e}")
 
 
 async def publish_complete(
@@ -296,9 +347,7 @@ async def publish_complete(
     text: str,
     pair_id: int,
 ):
-    """
-    Publish a completed transcript chunk to room.
-    """
+    """Publish a completed transcript chunk to room."""
     if not text.strip():
         return
 
@@ -307,17 +356,15 @@ async def publish_complete(
             "pair_id": str(pair_id),
             "status": "complete",
             "type": "transcript",
+            "language": INPUT_LANGUAGE,
             "participant_identity": participant.identity,
         }
-
         await ctx.room.local_participant.send_text(
-            text,
-            topic="lk.transcription",
-            attributes=attributes,
+            text, topic="lk.transcription", attributes=attributes
         )
-        logger.info(f"[COMPLETE] pair={pair_id}: {text}")
+        logger.info(f"[COMPLETE] pair={pair_id} lang={INPUT_LANGUAGE}: {text}")
     except Exception as e:
-        logger.error(f"❌ Failed to publish complete: {e}")
+        logger.error(f"Failed to publish complete: {e}")
 
 
 async def translate_and_publish(
@@ -325,29 +372,36 @@ async def translate_and_publish(
     participant: rtc.RemoteParticipant,
     text: str,
     pair_id: int,
+    target_lang: str,
+    audio_sources: dict[str, rtc.AudioSource],
 ):
     """
-    Translate text to Spanish and publish to room.
+    Translate text to target language, publish translation, and synthesize TTS.
     """
     try:
-        translation = await translate_to_spanish(text)
+        # Translate
+        translation = await translate_text(text, target_lang)
         
+        # Publish translation text
         attributes = {
             "pair_id": str(pair_id),
             "status": "complete",
             "type": "translation",
+            "language": target_lang,
             "participant_identity": participant.identity,
             "original_text": text,
         }
-        
         await ctx.room.local_participant.send_text(
-            translation,
-            topic="lk.transcription",
-            attributes=attributes,
+            translation, topic="lk.transcription", attributes=attributes
         )
-        logger.info(f"[TRANSLATED] pair={pair_id}: {translation}")
+        logger.info(f"[TRANSLATED] pair={pair_id} lang={target_lang}: {translation}")
+        
+        # TTS: synthesize and play audio
+        await synthesize_and_play(translation, target_lang, audio_sources[target_lang])
+        logger.info(f"[TTS] pair={pair_id} lang={target_lang}: audio played")
+        
     except Exception as e:
-        logger.error(f"❌ Translation failed for pair={pair_id}: {e}")
+        logger.error(f"Translation/TTS to {target_lang} failed for pair={pair_id}: {e}")
 
 
 if __name__ == "__main__":

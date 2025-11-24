@@ -99,18 +99,36 @@ OUTPUT_LANGUAGES = ["es", "fr", "ar"]  # Spanish, French, Arabic
 
 ---
 
-## Future: TTS Payloads
+## TTS Audio Tracks
 
-When TTS is added (Cartesia Sonic 3), audio will be published separately:
+Audio is published via LiveKit audio tracks (not data messages). One track per output language:
+
+| Track Name | Language | Sample Rate |
+|------------|----------|-------------|
+| `tts-es` | Spanish | 24kHz mono |
+| `tts-fr` | French | 24kHz mono |
+| `tts-ar` | Arabic | 24kHz mono |
+
+Each translation triggers TTS synthesis via Cartesia Sonic 3, which streams audio frames to the corresponding track.
 
 ```python
-# Attributes (planned)
-{
-    "pair_id": "1",
-    "type": "tts_audio",
-    "language": "es",
-    "participant_identity": "user-123",
-}
-# Binary audio data published via audio track or byte stream
+# Track creation in agent.py
+for lang in OUTPUT_LANGUAGES:
+    source = rtc.AudioSource(24000, 1)  # 24kHz mono
+    track = rtc.LocalAudioTrack.create_audio_track(f"tts-{lang}", source)
+    await ctx.room.local_participant.publish_track(track)
+```
+
+---
+
+## Environment Variables
+
+```
+SPEECHMATICS_API_KEY=...
+OPENAI_API_KEY=...
+CARTESIA_API_KEY=...
+LIVEKIT_URL=...
+LIVEKIT_API_KEY=...
+LIVEKIT_API_SECRET=...
 ```
 
