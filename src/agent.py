@@ -2,6 +2,7 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass
+from typing import Optional
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -27,7 +28,7 @@ openai_client = AsyncOpenAI()
 # Language Configuration
 # =============================================================================
 INPUT_LANGUAGE = "en"
-OUTPUT_LANGUAGES = ["es", "fr", "ar"]
+OUTPUT_LANGUAGES = ["ar"]
 LANG_NAMES = {
     "en": "English",
     "es": "Spanish", 
@@ -134,6 +135,36 @@ async def synthesize_and_play(text: str, language: str, audio_source: rtc.AudioS
 
 
 # =============================================================================
+# TTS Consumer (Queue-based serialization)
+# =============================================================================
+async def tts_consumer(
+    queue: asyncio.Queue,
+    audio_source: rtc.AudioSource,
+    language: str,
+):
+    """
+    Process TTS jobs sequentially for a single language.
+    Ensures no concurrent capture_frame() calls on the same audio source.
+    """
+    logger.info(f"TTS consumer started for {language}")
+    while True:
+        job = await queue.get()
+        if job is None:  # Shutdown signal
+            logger.info(f"TTS consumer shutting down for {language}")
+            break
+        
+        text, pair_id = job
+        try:
+            logger.info(f"[TTS START] pair={pair_id} lang={language}")
+            await synthesize_and_play(text, language, audio_source)
+            logger.info(f"[TTS DONE] pair={pair_id} lang={language}")
+        except Exception as e:
+            logger.error(f"TTS failed for pair={pair_id} lang={language}: {e}")
+        finally:
+            queue.task_done()
+
+
+# =============================================================================
 # Main Agent
 # =============================================================================
 @server.rtc_session()
@@ -141,8 +172,8 @@ async def transcription_agent(ctx: JobContext):
     """
     Real-time transcription and translation agent.
     - Transcribes with Speechmatics
-    - Translates to multiple languages (es, fr, ar) with GPT-4.1
-    - Synthesizes audio with Cartesia Sonic 3
+    - Translates to multiple languages with GPT-4.1
+    - Synthesizes audio with Cartesia Sonic 3 (serialized via queues)
     """
     ctx.log_context_fields = {"room": ctx.room.name}
     logger.info(f"Transcription agent starting in room: {ctx.room.name}")
@@ -163,6 +194,19 @@ async def transcription_agent(ctx: JobContext):
         audio_sources[lang] = source
         logger.info(f"Published TTS audio track: tts-{lang}")
 
+    # ==========================================================================
+    # Create TTS queues and consumer tasks (serialized playback)
+    # ==========================================================================
+    tts_queues: dict[str, asyncio.Queue] = {}
+    tts_tasks: dict[str, asyncio.Task] = {}
+    
+    for lang in OUTPUT_LANGUAGES:
+        queue: asyncio.Queue[Optional[tuple[str, int]]] = asyncio.Queue()
+        tts_queues[lang] = queue
+        tts_tasks[lang] = asyncio.create_task(
+            tts_consumer(queue, audio_sources[lang], lang)
+        )
+
     # Track active transcription tasks
     active_tasks: dict[str, asyncio.Task] = {}
 
@@ -175,7 +219,7 @@ async def transcription_agent(ctx: JobContext):
         if track.kind == rtc.TrackKind.KIND_AUDIO:
             logger.info(f"Audio track subscribed from {participant.identity}")
             task = asyncio.create_task(
-                process_audio_track(ctx, track, participant, audio_sources)
+                process_audio_track(ctx, track, participant, tts_queues)
             )
             active_tasks[participant.identity] = task
 
@@ -197,7 +241,7 @@ async def transcription_agent(ctx: JobContext):
             if publication.track and publication.track.kind == rtc.TrackKind.KIND_AUDIO:
                 logger.info(f"Found existing audio track from {participant.identity}")
                 task = asyncio.create_task(
-                    process_audio_track(ctx, publication.track, participant, audio_sources)
+                    process_audio_track(ctx, publication.track, participant, tts_queues)
                 )
                 active_tasks[participant.identity] = task
 
@@ -209,20 +253,31 @@ async def transcription_agent(ctx: JobContext):
         logger.info("Agent cancelled, cleaning up...")
         for task in active_tasks.values():
             task.cancel()
+    finally:
+        # Graceful shutdown of TTS consumers
+        logger.info("Shutting down TTS consumers...")
+        for lang, queue in tts_queues.items():
+            await queue.put(None)  # Signal shutdown
+        for lang, task in tts_tasks.items():
+            try:
+                await asyncio.wait_for(task, timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"TTS consumer for {lang} did not shut down in time")
+                task.cancel()
 
 
 async def process_audio_track(
     ctx: JobContext,
     track: rtc.RemoteTrack,
     participant: rtc.RemoteParticipant,
-    audio_sources: dict[str, rtc.AudioSource],
+    tts_queues: dict[str, asyncio.Queue],
 ):
     """
     Process audio from a participant:
     1. Transcribe with Speechmatics
     2. Buffer until commit (5+ words + punctuation)
     3. Translate to all output languages in parallel
-    4. Synthesize TTS for each translation
+    4. Queue TTS for serialized playback
     """
     logger.info(f"Starting transcription for {participant.identity}")
 
@@ -270,12 +325,12 @@ async def process_audio_track(
                             # Publish complete transcript
                             await publish_complete(ctx, participant, committed, buffer.pair_id)
                             
-                            # Parallel translation + TTS for all output languages
+                            # Parallel translation + queue TTS for all output languages
                             for lang in OUTPUT_LANGUAGES:
                                 asyncio.create_task(
                                     translate_and_publish(
                                         ctx, participant, committed, buffer.pair_id, 
-                                        lang, audio_sources
+                                        lang, tts_queues
                                     )
                                 )
                             
@@ -373,16 +428,17 @@ async def translate_and_publish(
     text: str,
     pair_id: int,
     target_lang: str,
-    audio_sources: dict[str, rtc.AudioSource],
+    tts_queues: dict[str, asyncio.Queue],
 ):
     """
-    Translate text to target language, publish translation, and synthesize TTS.
+    Translate text to target language, publish translation, and queue TTS.
+    TTS is queued (not direct) to ensure serialized playback.
     """
     try:
         # Translate
         translation = await translate_text(text, target_lang)
         
-        # Publish translation text
+        # Publish translation text (immediate)
         attributes = {
             "pair_id": str(pair_id),
             "status": "complete",
@@ -396,9 +452,9 @@ async def translate_and_publish(
         )
         logger.info(f"[TRANSLATED] pair={pair_id} lang={target_lang}: {translation}")
         
-        # TTS: synthesize and play audio
-        await synthesize_and_play(translation, target_lang, audio_sources[target_lang])
-        logger.info(f"[TTS] pair={pair_id} lang={target_lang}: audio played")
+        # Queue TTS job for serialized playback
+        await tts_queues[target_lang].put((translation, pair_id))
+        logger.info(f"[TTS QUEUED] pair={pair_id} lang={target_lang}")
         
     except Exception as e:
         logger.error(f"Translation/TTS to {target_lang} failed for pair={pair_id}: {e}")

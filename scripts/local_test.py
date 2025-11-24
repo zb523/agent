@@ -11,6 +11,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import pyaudio
 from dotenv import load_dotenv
@@ -38,7 +39,7 @@ openai_client = AsyncOpenAI()
 # Language Configuration (mirrors agent.py)
 # =============================================================================
 INPUT_LANGUAGE = "en"
-OUTPUT_LANGUAGES = ["es", "fr", "ar"]
+OUTPUT_LANGUAGES = ["ar"]  # Match agent.py
 LANG_NAMES = {
     "en": "English",
     "es": "Spanish",
@@ -134,13 +135,44 @@ def publish_to_room(pair_id: int, text: str, status: str, msg_type: str, languag
             print(f"       (original: {original})")
 
 
-async def handle_translation(text: str, pair_id: int, target_lang: str):
-    """Translate to a single language and print result."""
+# =============================================================================
+# TTS Consumer (Queue-based serialization - mirrors agent.py)
+# =============================================================================
+async def tts_consumer(queue: asyncio.Queue, language: str):
+    """
+    Process TTS jobs sequentially for a single language.
+    In local test, we simulate TTS with a sleep.
+    """
+    print(f"  [TTS CONSUMER] Started for {language}")
+    while True:
+        job = await queue.get()
+        if job is None:  # Shutdown signal
+            print(f"  [TTS CONSUMER] Shutting down for {language}")
+            break
+        
+        text, pair_id = job
+        try:
+            print(f"  🔊 [TTS START] pair={pair_id} lang={language}: '{text[:30]}...'")
+            # Simulate TTS playback time (roughly 100ms per word)
+            word_count = len(text.split())
+            await asyncio.sleep(word_count * 0.1)
+            print(f"  🔊 [TTS DONE] pair={pair_id} lang={language}")
+        except Exception as e:
+            print(f"  ❌ TTS failed for pair={pair_id} lang={language}: {e}")
+        finally:
+            queue.task_done()
+
+
+async def handle_translation(text: str, pair_id: int, target_lang: str, tts_queue: asyncio.Queue):
+    """Translate to a single language and queue TTS."""
     try:
         translation = await translate_text(text, target_lang)
         publish_to_room(pair_id, translation, "complete", "translation", target_lang, original=text)
-        # Note: In agent.py, TTS would be called here. For local test, we just print.
-        print(f"       [TTS skipped locally for {target_lang}]")
+        
+        # Queue TTS job for serialized playback (mirrors agent.py)
+        await tts_queue.put((translation, pair_id))
+        print(f"       [TTS QUEUED] pair={pair_id} lang={target_lang}")
+        
     except Exception as e:
         print(f"  ❌ Translation to {target_lang} failed: {e}")
 
@@ -157,8 +189,20 @@ async def run():
     print(f"Input: {INPUT_LANGUAGE} ({LANG_NAMES[INPUT_LANGUAGE]})")
     print(f"Output: {', '.join(f'{lang} ({LANG_NAMES[lang]})' for lang in OUTPUT_LANGUAGES)}")
     print("Translation model: GPT-4.1")
+    print("TTS: Simulated with queue serialization (mirrors agent.py)")
     print("Press Ctrl+C to stop")
     print("=" * 80 + "\n")
+
+    # ==========================================================================
+    # Create TTS queues and consumer tasks (serialized playback)
+    # ==========================================================================
+    tts_queues: dict[str, asyncio.Queue] = {}
+    tts_tasks: dict[str, asyncio.Task] = {}
+    
+    for lang in OUTPUT_LANGUAGES:
+        queue: asyncio.Queue[Optional[tuple[str, int]]] = asyncio.Queue()
+        tts_queues[lang] = queue
+        tts_tasks[lang] = asyncio.create_task(tts_consumer(queue, lang))
 
     # Create STT
     stt = speechmatics.STT(
@@ -226,10 +270,10 @@ async def run():
                             # Publish complete transcript
                             publish_to_room(buffer.pair_id, committed, "complete", "transcript", INPUT_LANGUAGE)
                             
-                            # Parallel translation to all output languages
+                            # Parallel translation + queue TTS for all output languages
                             for lang in OUTPUT_LANGUAGES:
                                 task = asyncio.create_task(
-                                    handle_translation(committed, buffer.pair_id, lang)
+                                    handle_translation(committed, buffer.pair_id, lang, tts_queues[lang])
                                 )
                                 pending_translations.append(task)
                             
@@ -267,6 +311,17 @@ async def run():
         if pending_translations:
             print(f"Waiting for {len(pending_translations)} translations...")
             await asyncio.gather(*pending_translations, return_exceptions=True)
+        
+        # Graceful shutdown of TTS consumers
+        print("Shutting down TTS consumers...")
+        for lang, queue in tts_queues.items():
+            await queue.put(None)  # Signal shutdown
+        for lang, task in tts_tasks.items():
+            try:
+                await asyncio.wait_for(task, timeout=5.0)
+            except asyncio.TimeoutError:
+                print(f"TTS consumer for {lang} did not shut down in time")
+                task.cancel()
         
         # Flush any uncommitted text
         uncommitted = buffer.uncommitted
