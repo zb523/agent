@@ -11,6 +11,8 @@ wheels/
 
 *.mp3
 
+legacy/
+
 # Environment files
 .env
 .env.local
