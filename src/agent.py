@@ -3,17 +3,33 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 import httpx
 from livekit import rtc
 from livekit.agents import AgentServer, JobContext, cli
-from livekit.agents.stt import SpeechEventType
-from livekit.plugins import speechmatics, cartesia
-from livekit.plugins.speechmatics import EndOfUtteranceMode
+from livekit.plugins import cartesia
+
+# Speechmatics RT client
+from speechmatics.rt import (
+    AsyncClient as SMAsyncClient,
+    ServerMessageType as SMServerMessageType,
+    TranscriptionConfig as SMTranscriptionConfig,
+    AudioFormat as SMAudioFormat,
+    AudioEncoding as SMAudioEncoding,
+)
+
+# DO NOT make this src.transcription
+from transcription import (
+    current_buffer_text,
+    find_strict_eos_idx,
+    find_relaxed_tail_idx,
+    decide_commit_split,
+)
 
 from retriever import (
     QuranIndex,
@@ -36,7 +52,27 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
+# Silence noisy third-party loggers (WebSocket frames, TLS handshakes, etc.)
+logging.getLogger("websockets").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("asyncio").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("livekit.plugins.cartesia").setLevel(logging.WARNING)
+logging.getLogger("livekit").setLevel(logging.WARNING)
+logging.getLogger("speechmatics").setLevel(logging.WARNING)
+logging.getLogger("speechmatics.rt").setLevel(logging.WARNING)
+logging.getLogger("speechmatics.rt.client").setLevel(logging.WARNING)
+
 load_dotenv(".env.local")
+
+# Default RT URL if not set
+os.environ.setdefault("SPEECHMATICS_RT_URL", "wss://eu2.rt.speechmatics.com/v2")
+SPEECHMATICS_RT_URL = os.getenv("SPEECHMATICS_RT_URL", "wss://eu2.rt.speechmatics.com/v2")
+
+SPEECHMATICS_API_KEY = os.getenv("SPEECHMATICS_API_KEY", "").strip()
+if not SPEECHMATICS_API_KEY:
+    logger.error("SPEECHMATICS_API_KEY missing")
 
 # OpenAI client for translation (lazy initialization to avoid build-time errors)
 _openai_client: Optional[AsyncOpenAI] = None
@@ -65,7 +101,7 @@ LANG_NAMES = {
 # Worker API
 # =============================================================================
 WORKER_URL = os.getenv("WORKER_URL", "")
-LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "")
+WORKER_AUTH_SECRET = os.getenv("WORKER_AUTH_SECRET", "")
 
 
 async def save_to_worker(
@@ -79,14 +115,14 @@ async def save_to_worker(
     if not WORKER_URL:
         logger.warning("WORKER_URL not set, skipping DB save")
         return
-    if not LIVEKIT_API_SECRET:
-        logger.warning("LIVEKIT_API_SECRET not set, skipping DB save")
+    if not WORKER_AUTH_SECRET:
+        logger.warning("WORKER_AUTH_SECRET not set, skipping DB save")
         return
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{WORKER_URL}/api/history/save",
-                headers={"Authorization": f"Bearer {LIVEKIT_API_SECRET}"},
+                headers={"Authorization": f"Bearer {WORKER_AUTH_SECRET}"},
                 json={
                     "session_id": session_id,
                     "sequence_id": pair_id,
@@ -102,69 +138,42 @@ async def save_to_worker(
         logger.error(f"Failed to save to worker: {e}")
 
 # Buffer configuration
-PUNCTUATION = re.compile(r'[.!?,;:]')
-MIN_WORDS = 5
+MIN_WORDS_BEFORE_COMMIT = 10  # match local_test_rt behavior
+
+# STT Retry configuration
+MAX_STT_RETRIES = 3
+STT_RETRY_DELAY = 2.0  # seconds
 
 # =============================================================================
 # MT (Machine Translation) Configuration - HuggingFace Endpoint
 # =============================================================================
-# MT_ENDPOINT = os.getenv("HF_ENDPOINT", "https://your-hf-endpoint.huggingface.cloud")
-# MT_API_KEY = os.getenv("HF_API_KEY", "")
-MT_ENABLED = False  # Toggle to enable MT for incomplete translations
+MT_ENDPOINT = "https://zhr3wzqjdk9vxlby.us-east-1.aws.endpoints.huggingface.cloud/v1/chat/completions"
+MT_API_KEY = "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"
+MT_ENABLED = True  # Toggle to enable MT for incomplete translations
 MT_TICK_INTERVAL = 0.2  # 200ms
 
 server = AgentServer()
 
 
 @dataclass
-class TranscriptBuffer:
+class TokenBuffer:
     """
-    Buffer for tracking cumulative Speechmatics transcripts.
-    
-    Speechmatics INTERIM events contain the FULL transcript so far (cumulative),
-    not incremental updates. We track committed_idx to know what we've already
-    processed, and only look at uncommitted text for new commits.
+    Token-based buffer for RT transcription.
+    Simple container for tokens, pair_id, and last published text.
     """
     pair_id: int = 1
-    full_text: str = ""
-    committed_idx: int = 0
+    tokens: List[str] = field(default_factory=list)
     last_published_text: str = ""
     
     @property
-    def uncommitted(self) -> str:
-        """Text after the committed position, stripped."""
-        return self.full_text[self.committed_idx:].lstrip()
+    def text(self) -> str:
+        """Join all tokens into full text using the same rules as transcription.py."""
+        return current_buffer_text(self.tokens)
     
-    def find_commit_point(self) -> int | None:
-        """Find commit point in UNCOMMITTED text only (first punct after MIN_WORDS)."""
-        text = self.uncommitted
-        if not text:
-            return None
-        words_seen = 0
-        for i, char in enumerate(text):
-            if char == ' ':
-                words_seen += 1
-            if words_seen >= MIN_WORDS - 1 and PUNCTUATION.match(char):
-                return i + 1
-        return None
-    
-    def commit(self) -> str:
-        """
-        Commit text up to the commit point. Returns the committed text.
-        Advances committed_idx so we don't re-commit the same text.
-        """
-        idx = self.find_commit_point()
-        if idx is None:
-            return ""
-        
-        uncommitted = self.uncommitted
-        committed = uncommitted[:idx].strip()
-        
-        raw_uncommitted = self.full_text[self.committed_idx:]
-        lstrip_offset = len(raw_uncommitted) - len(raw_uncommitted.lstrip())
-        self.committed_idx += lstrip_offset + idx
-        
-        return committed
+    def clear(self):
+        """Clear the buffer."""
+        self.tokens = []
+        self.last_published_text = ""
 
 
 @dataclass
@@ -174,10 +183,16 @@ class MTState:
     - last_translated_text: what we last sent to MT (to detect buffer growth)
     - active_streams: per-language lock to prevent overlapping MT requests
     - completed_pairs: set of pair_ids that GPT has completed (skip further MT)
+    - output_cache: pair_id -> last published text (for monotonic publishing)
+    - last_emit_ts: pair_id -> timestamp of last emit (for debouncing)
+    - tasks_by_pair: pair_id -> set of running MT tasks (for cancellation)
     """
     last_translated_text: str = ""
     active_streams: dict[str, bool] = field(default_factory=dict)
     completed_pairs: set[int] = field(default_factory=set)
+    output_cache: dict[int, str] = field(default_factory=dict)
+    last_emit_ts: dict[int, float] = field(default_factory=dict)
+    tasks_by_pair: dict[int, set] = field(default_factory=dict)
 
 
 # =============================================================================
@@ -335,35 +350,9 @@ async def translate_text(
 
 
 # =============================================================================
-# MT (Machine Translation) - HuggingFace Streaming
+# MT (Machine Translation) - HuggingFace Streaming (httpx SSE)
 # =============================================================================
-# async def translate_mt(text: str, target_lang: str) -> str:
-#     """
-#     Stream MT translation from HuggingFace endpoint (OpenAI-compatible).
-#     Returns the complete translated text after streaming finishes.
-#     
-#     Uses the same openai client pointed at HF endpoint via base_url override.
-#     """
-#     mt_client = AsyncOpenAI(
-#         base_url=MT_ENDPOINT,
-#         api_key=MT_API_KEY,
-#     )
-#     
-#     result = ""
-#     stream = await mt_client.chat.completions.create(
-#         model="tgi",  # HF TGI model identifier
-#         messages=[
-#             {"role": "system", "content": f"Translate to {LANG_NAMES[target_lang]}. Return only the translation."},
-#             {"role": "user", "content": text}
-#         ],
-#         stream=True,
-#     )
-#     
-#     async for chunk in stream:
-#         if chunk.choices and chunk.choices[0].delta.content:
-#             result += chunk.choices[0].delta.content
-#     
-#     return result.strip()
+# Note: translate_mt() removed - we now stream and publish inline via run_mt_stream_httpx()
 
 
 # =============================================================================
@@ -443,72 +432,176 @@ async def tts_consumer(
 
 
 # =============================================================================
-# MT Ticker and Stream Handler (disabled until MT_ENABLED=True)
+# MT Ticker and Stream Handler (httpx SSE)
 # =============================================================================
-# async def mt_ticker(
-#     ctx: JobContext,
-#     participant: rtc.RemoteParticipant,
-#     buffer: TranscriptBuffer,
-#     mt_state: MTState,
-# ):
-#     """
-#     Global 200ms ticker for MT translations.
-#     If buffer has grown since last MT, fire off MT requests for all languages.
-#     """
-#     while True:
-#         await asyncio.sleep(MT_TICK_INTERVAL)
-#         
-#         # Skip if buffer hasn't grown or pair already completed by GPT
-#         uncommitted = buffer.uncommitted
-#         if not uncommitted or uncommitted == mt_state.last_translated_text:
-#             continue
-#         if buffer.pair_id in mt_state.completed_pairs:
-#             continue
-#         
-#         mt_state.last_translated_text = uncommitted
-#         
-#         # Fire MT for all output languages (if not already active)
-#         for lang in OUTPUT_LANGUAGES:
-#             if not mt_state.active_streams.get(lang, False):
-#                 asyncio.create_task(
-#                     run_mt_stream(ctx, participant, uncommitted, buffer.pair_id, lang, mt_state)
-#                 )
+async def mt_ticker(
+    ctx: JobContext,
+    participant: rtc.RemoteParticipant,
+    buffer: TokenBuffer,
+    mt_state: MTState,
+    output_langs: List[str],
+):
+    """
+    Global 200ms ticker for MT translations.
+    If buffer has grown since last MT, fire off MT requests for all languages.
+    Tracks tasks per pair for cancellation when GPT commits.
+    """
+    while True:
+        await asyncio.sleep(MT_TICK_INTERVAL)
+        
+        # Skip if buffer hasn't grown or pair already completed by GPT
+        current_text = buffer.text
+        if not current_text or current_text == mt_state.last_translated_text:
+            continue
+        if buffer.pair_id in mt_state.completed_pairs:
+            continue
+        
+        mt_state.last_translated_text = current_text
+        pair_id = buffer.pair_id
+        
+        # Fire MT for all output languages (if not already active)
+        for lang in output_langs:
+            if not mt_state.active_streams.get(lang, False):
+                task = asyncio.create_task(
+                    run_mt_stream_httpx(ctx, participant, current_text, pair_id, lang, mt_state)
+                )
+                # Track task for cancellation on commit
+                tasks = mt_state.tasks_by_pair.setdefault(pair_id, set())
+                tasks.add(task)
+                task.add_done_callback(lambda t, p=pair_id: _cleanup_mt_task(mt_state, p, t))
 
 
-# async def run_mt_stream(
-#     ctx: JobContext,
-#     participant: rtc.RemoteParticipant,
-#     text: str,
-#     pair_id: int,
-#     lang: str,
-#     mt_state: MTState,
-# ):
-#     """
-#     Run MT stream for a single language.
-#     Publishes incomplete translation when stream completes.
-#     No TTS for incomplete translations.
-#     """
-#     mt_state.active_streams[lang] = True
-#     try:
-#         # Skip if GPT already completed this pair
-#         if pair_id in mt_state.completed_pairs:
-#             return
-#         
-#         translation = await translate_mt(text, lang)
-#         
-#         # Double-check GPT didn't complete while we were translating
-#         if pair_id in mt_state.completed_pairs:
-#             return
-#         
-#         # Publish incomplete translation (no TTS)
-#         await publish_translation(
-#             ctx, participant, translation, pair_id, lang,
-#             status="incomplete", original_text=text
-#         )
-#     except Exception as e:
-#         logger.error(f"MT stream failed for pair={pair_id} lang={lang}: {e}")
-#     finally:
-#         mt_state.active_streams[lang] = False
+def _cleanup_mt_task(mt_state: MTState, pair_id: int, task: asyncio.Task):
+    """Remove completed task from tracking set."""
+    tasks = mt_state.tasks_by_pair.get(pair_id)
+    if tasks:
+        tasks.discard(task)
+        if not tasks:
+            mt_state.tasks_by_pair.pop(pair_id, None)
+
+
+async def run_mt_stream_httpx(
+    ctx: JobContext,
+    participant: rtc.RemoteParticipant,
+    text: str,
+    pair_id: int,
+    lang: str,
+    mt_state: MTState,
+):
+    """
+    Stream MT translation via httpx SSE, publish partials as tokens arrive.
+    
+    - Monotonic publishing: only publish if len(new) > len(prev)
+    - Micro-debounce: 50ms per pair to avoid flicker
+    - Stops if pair is marked complete by GPT
+    """
+    mt_state.active_streams[lang] = True
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {MT_API_KEY}",
+    }
+    
+    prompt = f"Translate to {LANG_NAMES[lang]}. Output ONLY the translation, nothing else. Even if the text is incomplete, translate what you have.\n\n{text}"
+    payload = {
+        "model": "tgi",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.7,
+        "stream": True,
+        "max_tokens": 512,
+    }
+    
+    acc = ""
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            async with client.stream("POST", MT_ENDPOINT, headers=headers, json=payload) as resp:
+                if resp.status_code != 200:
+                    logger.warning(f"MT HTTP {resp.status_code} for pair={pair_id} lang={lang}")
+                    return
+                
+                async for line in resp.aiter_lines():
+                    # Check if GPT completed this pair
+                    if pair_id in mt_state.completed_pairs:
+                        return
+                    
+                    if not line:
+                        continue
+                    
+                    s = line.strip()
+                    if not s:
+                        continue
+                    
+                    # Parse SSE format: "data: {...}"
+                    if s.startswith("data:"):
+                        s = s[len("data:"):].strip()
+                    
+                    if s == "[DONE]":
+                        break
+                    
+                    # Skip non-JSON lines
+                    if not (s.startswith("{") and s.endswith("}")):
+                        continue
+                    
+                    try:
+                        obj = json.loads(s)
+                    except json.JSONDecodeError:
+                        continue
+                    
+                    # Extract delta content
+                    choices = obj.get("choices", [])
+                    if not choices:
+                        continue
+                    
+                    delta = choices[0].get("delta", {}).get("content")
+                    if not delta:
+                        continue
+                    
+                    acc += delta
+                    
+                    # Monotonic check: only publish if longer than previous
+                    prev = mt_state.output_cache.get(pair_id, "")
+                    if len(acc) <= len(prev):
+                        continue
+                    
+                    # Debounce: 50ms per pair
+                    now = time.time()
+                    last_emit = mt_state.last_emit_ts.get(pair_id, 0)
+                    if (now - last_emit) < 0.05:
+                        continue
+                    
+                    # Update cache and emit
+                    mt_state.output_cache[pair_id] = acc
+                    mt_state.last_emit_ts[pair_id] = now
+                    
+                    # Publish partial translation
+                    await publish_translation(
+                        ctx, participant, acc, pair_id, lang,
+                        status="incomplete", original_text=text
+                    )
+                    logger.debug(f"[MT PARTIAL] pair={pair_id} lang={lang} len={len(acc)}")
+        
+        # Final publish if we have content and pair not completed
+        if acc and pair_id not in mt_state.completed_pairs:
+            prev = mt_state.output_cache.get(pair_id, "")
+            if len(acc) > len(prev):
+                mt_state.output_cache[pair_id] = acc
+                await publish_translation(
+                    ctx, participant, acc, pair_id, lang,
+                    status="incomplete", original_text=text
+                )
+            logger.info(f"[MT DONE] pair={pair_id} lang={lang}: {acc[:50]}...")
+    
+    except asyncio.CancelledError:
+        logger.debug(f"[MT CANCELLED] pair={pair_id} lang={lang}")
+    except httpx.ConnectError:
+        logger.debug(f"[MT OFFLINE] endpoint unavailable for pair={pair_id} lang={lang}")
+    except httpx.TimeoutException:
+        logger.debug(f"[MT TIMEOUT] for pair={pair_id} lang={lang}")
+    except Exception as e:
+        logger.error(f"MT stream failed for pair={pair_id} lang={lang}: {e}")
+    finally:
+        mt_state.active_streams[lang] = False
 
 
 # =============================================================================
@@ -672,13 +765,13 @@ async def process_audio_track(
 ):
     """
     Process audio from a participant:
-    1. Transcribe with Speechmatics
-    2. Buffer until commit (5+ words + punctuation)
+    1. Transcribe with Speechmatics RT
+    2. Buffer until commit (10+ words + punctuation)
     3. Translate to all output languages in parallel
     4. Queue TTS for serialized playback
     """
     logger.info(f"Starting transcription for {participant.identity}")
-    
+
     # Extract config
     input_lang = config["input_lang"]
     output_langs = config["output_langs"]
@@ -688,109 +781,306 @@ async def process_audio_track(
     ar_map = config["ar_map"]
     translations = config["translations"]
 
-    # Speechmatics STT
-    stt = speechmatics.STT(
-        language=input_lang,
-        enable_partials=True,
-        end_of_utterance_mode=EndOfUtteranceMode.NONE,
-    )
-
-    stt_stream = stt.stream()
+    # Speechmatics RT configuration (same behavior as local_test_rt)
     audio_stream = rtc.AudioStream(track)
-    buffer = TranscriptBuffer()
+    buffer = TokenBuffer()
+    event_q: asyncio.Queue = asyncio.Queue()
     
-    # MT state for tracking incomplete translations
-    # mt_state = MTState() if MT_ENABLED else None
+    # MT state for incomplete translations
+    mt_state = MTState()
+    mt_task: Optional[asyncio.Task] = None
+    
+    # Start MT ticker if enabled
+    if MT_ENABLED:
+        mt_task = asyncio.create_task(
+            mt_ticker(ctx, participant, buffer, mt_state, output_langs)
+        )
+        logger.info(f"MT ticker started for {participant.identity}")
 
-    async def push_audio():
-        async for audio_event in audio_stream:
-            stt_stream.push_frame(audio_event.frame)
-        stt_stream.end_input()
-
-    async def process_stt_events():
-        nonlocal buffer
+    async def handle_commit_chunk(
+        committed: str,
+        pair_id: int,
+        input_lang: str,
+        output_langs: List[str],
+        quran_enabled: bool,
+        quran_index: Optional[QuranIndex],
+        direct_index: Optional[DirectIndex],
+        ar_map: Dict[str, Dict],
+        translations: Dict[str, Dict[str, str]],
+        tts_queues: Dict[str, asyncio.Queue],
+        ctx: JobContext,
+        participant: rtc.RemoteParticipant,
+        config: dict,
+        mt_state: MTState,
+    ):
+        """Publish a committed chunk, run Quran detection, translate, and queue TTS."""
+        # Mark pair complete and cancel any in-flight MT streams
+        mt_state.completed_pairs.add(pair_id)
+        tasks = mt_state.tasks_by_pair.pop(pair_id, None)
+        if tasks:
+            for t in tasks:
+                t.cancel()
+            logger.debug(f"[MT CANCEL] Cancelled {len(tasks)} MT tasks for pair={pair_id}")
         
-        async for event in stt_stream:
-            if event.type == SpeechEventType.START_OF_SPEECH:
-                logger.info(f"🎤 START OF SPEECH [{participant.identity}]")
+        await publish_complete(ctx, participant, committed, pair_id, input_lang)
 
-            elif event.type == SpeechEventType.INTERIM_TRANSCRIPT:
-                if event.alternatives:
-                    text = event.alternatives[0].text
-                    if not text:
-                        continue
-                    
-                    buffer.full_text = text
-                    uncommitted = buffer.uncommitted
-                    
-                    # Publish incomplete transcript if changed
-                    if uncommitted and uncommitted != buffer.last_published_text:
-                        await publish_buffer(ctx, participant, buffer, status="incomplete", input_lang=input_lang)
-                        buffer.last_published_text = uncommitted
-                    
-                    # Check for commit
-                    if buffer.find_commit_point():
-                        committed = buffer.commit()
-                        if committed:
-                            # Publish complete transcript
-                            await publish_complete(ctx, participant, committed, buffer.pair_id, input_lang)
-                            
-                            # Run Quran detection if enabled
-                            detections: List[Detection] = []
-                            if quran_enabled and quran_index and direct_index:
-                                fuzzy = detect_refs(quran_index, committed)
-                                direct = detect_refs_direct(direct_index, committed)
-                                detections = combine_detections(fuzzy, direct)
-                                if detections:
-                                    logger.info(f"🕌 QURAN DETECTED pair={buffer.pair_id}: {[d.ref for d in detections]}")
-                            
-                            # Parallel translation + queue TTS for all output languages
-                            for lang in output_langs:
-                                asyncio.create_task(
-                                    translate_and_publish(
-                                        ctx, participant, committed, buffer.pair_id, 
-                                        lang, tts_queues, detections=detections,
-                                        quran_enabled=quran_enabled, ar_map=ar_map, 
-                                        translations=translations,
-                                        session_id=config.get("session_id", ""),
-                                    )
-                                )
-                            
-                            old_pair = buffer.pair_id
-                            buffer.pair_id += 1
-                            buffer.last_published_text = ""
-                            logger.info(f"🔄 ROLLOVER: {old_pair} -> {buffer.pair_id}")
+        detections: List[Detection] = []
+        if quran_enabled and quran_index and direct_index:
+            fuzzy = detect_refs(quran_index, committed)
+            direct = detect_refs_direct(direct_index, committed)
+            detections = combine_detections(fuzzy, direct)
+            if detections:
+                logger.info(f"🕌 QURAN DETECTED pair={pair_id}: {[d.ref for d in detections]}")
 
-            elif event.type == SpeechEventType.FINAL_TRANSCRIPT:
-                if event.alternatives:
-                    text = event.alternatives[0].text
-                    if text:
-                        logger.debug(f"📋 FINAL (info only): {text}")
+        for lang in output_langs:
+            asyncio.create_task(
+                translate_and_publish(
+                    ctx,
+                    participant,
+                    committed,
+                    pair_id,
+                    lang,
+                    tts_queues,
+                    mt_state=mt_state,
+                    detections=detections,
+                    quran_enabled=quran_enabled,
+                    ar_map=ar_map,
+                    translations=translations,
+                    session_id=config.get("session_id", ""),
+                )
+            )
 
-            elif event.type == SpeechEventType.END_OF_SPEECH:
-                logger.info(f"🔇 END OF SPEECH [{participant.identity}]")
+    async def send_audio(sm_client: SMAsyncClient):
+        """Read audio frames from LiveKit and forward raw PCM to Speechmatics RT."""
+        async for audio_event in audio_stream:
+            frame = audio_event.frame
+            data = getattr(frame, "data", None)
+            if data is None:
+                continue
+            pcm_bytes = data.tobytes() if hasattr(data, "tobytes") else bytes(data)
+            await sm_client.send_audio(pcm_bytes)
 
-    # MT ticker task (commented out until MT_ENABLED=True)
-    # mt_ticker_task = None
-    
+    async def process_events():
+        """Process RT ADD_TRANSCRIPT messages exactly like local_test_rt."""
+        nonlocal buffer
+
+        # Pair state
+        pair_revs: Dict[int, int] = {}
+        last_partial_text: str = ""
+        last_partial_emit_ts: float = 0.0
+
+        while True:
+            etype, msg, _ts = await event_q.get()
+            if etype != "final":
+                continue
+
+            # Extract tokens from RT message
+            results = msg.get("results", []) if isinstance(msg, dict) else []
+            new_tokens: List[str] = []
+            for r in results:
+                alts = r.get("alternatives", [])
+                if not alts:
+                    continue
+                content = alts[0].get("content", "")
+                if content:
+                    new_tokens.append(content)
+
+            if not new_tokens:
+                continue
+
+            # Start a new pair when buffer is empty
+            if not buffer.tokens:
+                buffer.pair_id = max(buffer.pair_id, 1)
+                pair_revs.setdefault(buffer.pair_id, 0)
+                logger.info(f"[PAIR] started pair_id={buffer.pair_id}")
+
+            buffer.tokens.extend(new_tokens)
+            buf_text = buffer.text
+            logger.debug(
+                f"[RT] FINAL tokens+={len(new_tokens)} buffer_len={len(buffer.tokens)}: {buf_text}"
+            )
+
+            # Partial snapshot (TR incomplete)
+            if buf_text and buf_text != last_partial_text:
+                pid = buffer.pair_id
+                rev = pair_revs.get(pid, 0) + 1
+                pair_revs[pid] = rev
+                await publish_buffer(
+                    ctx, participant, buffer, status="incomplete", input_lang=input_lang
+                )
+                last_partial_text = buf_text
+                buffer.last_published_text = buf_text
+                last_partial_emit_ts = time.perf_counter()
+
+            # Commit gating
+            wc = len([t for t in buffer.tokens if t])
+            if wc < MIN_WORDS_BEFORE_COMMIT:
+                continue
+
+            strict_idx: Optional[int]
+            try:
+                strict_idx = find_strict_eos_idx(buffer.tokens)
+            except Exception:
+                strict_idx = None
+
+            commit_kind: Optional[str] = None
+            idx: Optional[int] = None
+
+            if strict_idx is not None and wc >= MIN_WORDS_BEFORE_COMMIT:
+                commit_kind = "HARD_PUNCT"
+                idx = int(strict_idx)
+            else:
+                soft_idx: Optional[int]
+                try:
+                    soft_idx = find_relaxed_tail_idx(buffer.tokens)
+                except Exception:
+                    soft_idx = None
+                if soft_idx is not None and soft_idx >= MIN_WORDS_BEFORE_COMMIT:
+                    commit_kind = "SOFT_COMMA_MAX"
+                    idx = int(soft_idx)
+
+            if idx is None or commit_kind is None:
+                continue
+
+            try:
+                commit_tokens, carry_tokens, allowed = decide_commit_split(
+                    buffer.tokens,
+                    idx,
+                    reason=commit_kind,
+                    min_words=MIN_WORDS_BEFORE_COMMIT,
+                )
+            except Exception:
+                commit_tokens, carry_tokens, allowed = (
+                    buffer.tokens[:idx],
+                    buffer.tokens[idx:],
+                    True,
+                )
+
+            if not (allowed and commit_tokens):
+                continue
+
+            pid = buffer.pair_id
+            commit_text = current_buffer_text(commit_tokens)
+            carry_text = current_buffer_text(carry_tokens) if carry_tokens else ""
+
+            # Update buffer to carry only
+            buffer.tokens = list(carry_tokens)
+
+            rev = pair_revs.get(pid, 0) + 1
+            pair_revs[pid] = rev
+
+            logger.info(
+                f"[TR COMMIT] pair={pid} rev={rev} reason={commit_kind}: {commit_text}"
+            )
+
+            # Handle this commit with your existing pipeline
+            await handle_commit_chunk(
+                commit_text,
+                pid,
+                input_lang,
+                output_langs,
+                quran_enabled,
+                quran_index,
+                direct_index,
+                ar_map,
+                translations,
+                tts_queues,
+                ctx,
+                participant,
+                config,
+                mt_state,
+            )
+
+            # Rollover to next pair if there is carry text
+            if carry_text:
+                buffer.pair_id = pid + 1
+                pair_revs[buffer.pair_id] = 1
+                buffer.tokens = carry_tokens
+                last_partial_text = carry_text
+                await publish_buffer(
+                    ctx, participant, buffer, status="incomplete", input_lang=input_lang
+                )
+                buffer.last_published_text = carry_text
+            else:
+                buffer.tokens = []
+                buffer.pair_id = pid + 1
+                buffer.last_published_text = ""
+                last_partial_text = ""
+
+    # Retry loop for RT connection timeouts
     try:
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(push_audio())
-            tg.create_task(process_stt_events())
-            # Start MT ticker if enabled
-            # if MT_ENABLED and mt_state:
-            #     mt_ticker_task = tg.create_task(mt_ticker(ctx, participant, buffer, mt_state))
-    except asyncio.CancelledError:
-        logger.info(f"Transcription cancelled for {participant.identity}")
-    except Exception as e:
-        logger.exception(f"Error in transcription for {participant.identity}: {e}")
+        for attempt in range(MAX_STT_RETRIES):
+            try:
+                async with SMAsyncClient(
+                    api_key=SPEECHMATICS_API_KEY,
+                    url=SPEECHMATICS_RT_URL,
+                ) as sm_client:
+
+                    @sm_client.on(SMServerMessageType.RECOGNITION_STARTED)
+                    def _on_started(msg) -> None:
+                        logger.info("Speechmatics RT started: %s", msg)
+
+                    @sm_client.on(SMServerMessageType.ADD_TRANSCRIPT)
+                    def _on_add_transcript(msg: Any) -> None:
+                        asyncio.create_task(event_q.put(("final", msg, time.time())))
+
+                    fmt = SMAudioFormat(
+                        encoding=SMAudioEncoding.PCM_S16LE,
+                        sample_rate=48000,
+                    )
+                    cfg = SMTranscriptionConfig(
+                        language=input_lang,
+                        operating_point="enhanced",
+                        max_delay=1.0,
+                        max_delay_mode="flexible",
+                        enable_partials=False,
+                        enable_entities=False,
+                        diarization="none",
+                    )
+
+                    await sm_client.start_session(
+                        transcription_config=cfg,
+                        audio_format=fmt,
+                    )
+
+                    async with asyncio.TaskGroup() as tg:
+                        tg.create_task(send_audio(sm_client))
+                        tg.create_task(process_events())
+
+                break  # Success
+            except asyncio.CancelledError:
+                logger.info(f"Transcription cancelled for {participant.identity}")
+                break
+            except Exception as e:
+                error_str = str(e).lower()
+                if "timeout" in error_str and attempt < MAX_STT_RETRIES - 1:
+                    logger.warning(
+                        f"STT connection timeout (attempt {attempt + 1}/{MAX_STT_RETRIES}), "
+                        f"retrying in {STT_RETRY_DELAY}s..."
+                    )
+                    await asyncio.sleep(STT_RETRY_DELAY)
+                else:
+                    logger.exception(
+                        f"Error in transcription for {participant.identity} "
+                        f"after {attempt + 1} attempts: {e}"
+                    )
+                    break
     finally:
+        # Cancel MT ticker if running
+        if mt_task:
+            mt_task.cancel()
+            try:
+                await mt_task
+            except asyncio.CancelledError:
+                pass
+            logger.info(f"MT ticker stopped for {participant.identity}")
+        
         # =======================================================================
         # Shutdown flush: force translate + TTS any remaining buffer
         # =======================================================================
-        uncommitted = buffer.uncommitted
-        if uncommitted and uncommitted != buffer.last_published_text:
-            logger.info(f"📤 SHUTDOWN FLUSH: '{uncommitted}'")
+        remaining_text = buffer.text
+        if remaining_text and remaining_text != buffer.last_published_text:
+            logger.info(f"📤 SHUTDOWN FLUSH: '{remaining_text}'")
             
             # Publish the incomplete transcript
             await publish_buffer(ctx, participant, buffer, status="complete", input_lang=input_lang)
@@ -799,7 +1089,7 @@ async def process_audio_track(
             for lang in output_langs:
                 try:
                     translation = await translate_text(
-                        uncommitted, lang, detections=[],
+                        remaining_text, lang, detections=[],
                         quran_enabled=quran_enabled, ar_map=ar_map,
                         translations_map=translations
                     )
@@ -810,18 +1100,17 @@ async def process_audio_track(
                     # Publish the forced translation
                     await publish_translation(
                         ctx, participant, translation, buffer.pair_id, lang,
-                        status="complete", original_text=uncommitted
+                        status="complete", original_text=remaining_text
                     )
                     
                     # Save to Worker API (fire-and-forget)
                     if config.get("session_id"):
                         asyncio.create_task(
-                            save_to_worker(config["session_id"], buffer.pair_id, uncommitted, translation, lang)
+                            save_to_worker(config["session_id"], buffer.pair_id, remaining_text, translation, lang)
                         )
                 except Exception as e:
                     logger.error(f"Shutdown flush failed for {lang}: {e}")
         
-        await stt_stream.aclose()
         logger.info(f"Transcription ended for {participant.identity}")
 
 
@@ -831,12 +1120,12 @@ async def process_audio_track(
 async def publish_buffer(
     ctx: JobContext,
     participant: rtc.RemoteParticipant,
-    buffer: TranscriptBuffer,
+    buffer: TokenBuffer,
     status: str,
     input_lang: str = DEFAULT_INPUT_LANGUAGE,
 ):
-    """Publish current uncommitted transcript to room."""
-    text = buffer.uncommitted
+    """Publish current buffer text to room."""
+    text = buffer.text
     if not text.strip():
         return
 
@@ -914,8 +1203,8 @@ async def translate_and_publish(
         )
         
         # Mark pair as completed by GPT (stops MT for this pair)
-        # if mt_state:
-        #     mt_state.completed_pairs.add(pair_id)
+        if mt_state:
+            mt_state.completed_pairs.add(pair_id)
         
         # Publish translation text (immediate) - keep tags for visual display
         await publish_translation(
