@@ -11,6 +11,7 @@ name = "agent"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "aiohttp" },
     { name = "elasticsearch" },
     { name = "httpx" },
     { name = "livekit" },
@@ -30,6 +31,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", specifier = ">=3.9.0" },
     { name = "elasticsearch", specifier = ">=9.2.0" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "livekit", specifier = ">=1.0.19" },

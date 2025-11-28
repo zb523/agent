@@ -1,18 +1,20 @@
 import asyncio
+import base64
 import json
 import logging
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+import aiohttp
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 import httpx
 from livekit import rtc
 from livekit.agents import AgentServer, JobContext, cli
-from livekit.plugins import cartesia
 
 # Speechmatics RT client
 from speechmatics.rt import (
@@ -377,32 +379,15 @@ def strip_tts_tags(text: str) -> str:
 
 
 # =============================================================================
-# TTS (Cartesia Sonic 3)
+# TTS (Cartesia Sonic 3) - Direct WebSocket API
 # =============================================================================
-def create_tts(language: str) -> cartesia.TTS:
-    """Create a Cartesia TTS instance for the given language."""
-    return cartesia.TTS(
-        model="sonic-3",
-        language=language,
-    )
-
-
-async def synthesize_and_play(text: str, language: str, audio_source: rtc.AudioSource):
-    """Synthesize text to speech and play on the audio source."""
-    try:
-        tts = create_tts(language)
-        tts_stream = tts.stream()
-        tts_stream.push_text(text)
-        tts_stream.end_input()
-        
-        async for audio in tts_stream:
-            await audio_source.capture_frame(audio.frame)
-    except Exception as e:
-        logger.error(f"TTS synthesis failed for {language}: {e}")
-
+CARTESIA_WS_URL = "wss://api.cartesia.ai/tts/websocket"
+CARTESIA_API_VERSION = "2024-06-10"
+MALE_VOICE_ID = "a167e0f3-df7e-4d52-a9c3-f949145efdab"  # Blake - Energetic American adult male
+TTS_SAMPLE_RATE = 24000
 
 # =============================================================================
-# TTS Consumer (Queue-based serialization)
+# TTS Consumer (Queue-based serialization with prosody continuity)
 # =============================================================================
 async def tts_consumer(
     queue: asyncio.Queue,
@@ -410,25 +395,92 @@ async def tts_consumer(
     language: str,
 ):
     """
-    Process TTS jobs sequentially for a single language.
-    Ensures no concurrent capture_frame() calls on the same audio source.
+    Process TTS jobs using direct Cartesia WebSocket API.
+    Maintains a persistent context_id for prosody continuity.
     """
-    logger.info(f"TTS consumer started for {language}")
-    while True:
-        job = await queue.get()
-        if job is None:  # Shutdown signal
-            logger.info(f"TTS consumer shutting down for {language}")
-            break
-        
-        text, pair_id = job
-        try:
-            logger.info(f"[TTS START] pair={pair_id} lang={language}")
-            await synthesize_and_play(text, language, audio_source)
-            logger.info(f"[TTS DONE] pair={pair_id} lang={language}")
-        except Exception as e:
-            logger.error(f"TTS failed for pair={pair_id} lang={language}: {e}")
-        finally:
-            queue.task_done()
+    api_key = os.environ.get("CARTESIA_API_KEY")
+    if not api_key:
+        logger.error(f"CARTESIA_API_KEY not set for {language}")
+        return
+    
+    context_id = f"tts-{language}-{uuid.uuid4().hex[:8]}"
+    logger.info(f"TTS consumer started for {language}, context_id={context_id}")
+    
+    ws_url = f"{CARTESIA_WS_URL}?api_key={api_key}&cartesia_version={CARTESIA_API_VERSION}"
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(ws_url) as ws:
+            try:
+                while True:
+                    job = await queue.get()
+                    if job is None:
+                        # Send final message to close context
+                        await ws.send_json({
+                            "context_id": context_id,
+                            "transcript": "",
+                            "continue": False,
+                            "model_id": "sonic-3",
+                            "voice": {"mode": "id", "id": MALE_VOICE_ID},
+                            "output_format": {
+                                "container": "raw",
+                                "encoding": "pcm_s16le",
+                                "sample_rate": TTS_SAMPLE_RATE,
+                            },
+                            "language": language,
+                        })
+                        logger.info(f"TTS consumer shutting down for {language}")
+                        break
+                    
+                    text, pair_id = job
+                    try:
+                        logger.info(f"[TTS START] pair={pair_id} lang={language}")
+                        
+                        # Send transcript with continue=True
+                        await ws.send_json({
+                            "context_id": context_id,
+                            "transcript": text,
+                            "continue": True,
+                            "model_id": "sonic-3",
+                            "voice": {"mode": "id", "id": MALE_VOICE_ID},
+                            "output_format": {
+                                "container": "raw",
+                                "encoding": "pcm_s16le",
+                                "sample_rate": TTS_SAMPLE_RATE,
+                            },
+                            "language": language,
+                        })
+                        
+                        # Receive audio chunks until done
+                        while True:
+                            msg = await ws.receive()
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                data = json.loads(msg.data)
+                                if data.get("data"):
+                                    pcm_bytes = base64.b64decode(data["data"])
+                                    samples_per_channel = len(pcm_bytes) // 2  # 16-bit
+                                    frame = rtc.AudioFrame(
+                                        data=pcm_bytes,
+                                        sample_rate=TTS_SAMPLE_RATE,
+                                        num_channels=1,
+                                        samples_per_channel=samples_per_channel,
+                                    )
+                                    await audio_source.capture_frame(frame)
+                                if data.get("done"):
+                                    break  # Utterance done, context stays alive
+                                if data.get("type") == "error":
+                                    logger.error(f"Cartesia error: {data}")
+                                    break
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                logger.error(f"WebSocket closed/error for {language}")
+                                break
+                        
+                        logger.info(f"[TTS DONE] pair={pair_id} lang={language}")
+                    except Exception as e:
+                        logger.error(f"TTS failed for pair={pair_id} lang={language}: {e}")
+                    finally:
+                        queue.task_done()
+            except Exception as e:
+                logger.error(f"TTS consumer error for {language}: {e}")
 
 
 # =============================================================================
