@@ -65,6 +65,8 @@ logging.getLogger("livekit").setLevel(logging.WARNING)
 logging.getLogger("speechmatics").setLevel(logging.WARNING)
 logging.getLogger("speechmatics.rt").setLevel(logging.WARNING)
 logging.getLogger("speechmatics.rt.client").setLevel(logging.WARNING)
+# Suppress LiveKit memory usage warnings (we know transphone uses ~500MB)
+logging.getLogger("livekit.agents").setLevel(logging.ERROR)
 
 load_dotenv(".env.local")
 
@@ -347,6 +349,7 @@ async def translate_text(
             {"role": "user", "content": user_prompt}
         ],
         temperature=0.0,
+        service_tier="priority",
     )
     return response.choices[0].message.content.strip()
 
