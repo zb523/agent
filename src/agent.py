@@ -140,7 +140,7 @@ async def save_to_worker(
         logger.error(f"Failed to save to worker: {e}")
 
 # Buffer configuration
-MIN_WORDS_BEFORE_COMMIT = 10  # match local_test_rt behavior
+MIN_WORDS_BEFORE_COMMIT = 5  # match local_test_rt behavior
 
 # STT Retry configuration
 MAX_STT_RETRIES = 3
