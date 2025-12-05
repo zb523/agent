@@ -142,7 +142,7 @@ async def save_to_worker(
         logger.error(f"Failed to save to worker: {e}")
 
 # Buffer configuration
-MIN_WORDS_BEFORE_COMMIT = 5  # match local_test_rt behavior
+MIN_WORDS_BEFORE_COMMIT = 10 # match local_test_rt behavior
 
 # STT Retry configuration
 MAX_STT_RETRIES = 3
@@ -152,7 +152,7 @@ STT_RETRY_DELAY = 2.0  # seconds
 # MT (Machine Translation) Configuration - HuggingFace Endpoint
 # =============================================================================
 MT_ENDPOINT = "https://zhr3wzqjdk9vxlby.us-east-1.aws.endpoints.huggingface.cloud/v1/chat/completions"
-MT_API_KEY = "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"
+MT_API_KEY = "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"
 MT_ENABLED = True  # Toggle to enable MT for incomplete translations
 MT_TICK_INTERVAL = 0.2  # 200ms
 
@@ -197,6 +197,39 @@ class MTState:
     output_cache: dict[int, str] = field(default_factory=dict)
     last_emit_ts: dict[int, float] = field(default_factory=dict)
     tasks_by_pair: dict[int, set] = field(default_factory=dict)
+
+
+@dataclass
+class RollingContext:
+    """
+    Rolling context for translation continuity.
+    Tracks last N Arabic segments and translations per language.
+    """
+    max_items: int = 5
+    arabic_segments: List[str] = field(default_factory=list)
+    translations: Dict[str, List[str]] = field(default_factory=dict)
+    
+    def add_arabic(self, text: str):
+        """Add a committed Arabic segment."""
+        self.arabic_segments.append(text)
+        if len(self.arabic_segments) > self.max_items:
+            self.arabic_segments.pop(0)
+    
+    def add_translation(self, lang: str, text: str):
+        """Add a completed translation."""
+        if lang not in self.translations:
+            self.translations[lang] = []
+        self.translations[lang].append(text)
+        if len(self.translations[lang]) > self.max_items:
+            self.translations[lang].pop(0)
+    
+    def get_arabic_context(self) -> List[str]:
+        """Get last N Arabic segments (oldest to newest)."""
+        return list(self.arabic_segments)
+    
+    def get_translation_context(self, lang: str) -> List[str]:
+        """Get last N translations for a language (oldest to newest)."""
+        return list(self.translations.get(lang, []))
 
 
 # =============================================================================
@@ -280,12 +313,29 @@ def build_user_prompt(
     detections: List[Detection],
     ar_map: Dict[str, Dict],
     translations_map: Dict[str, Dict[str, str]],
+    rolling_context: Optional["RollingContext"] = None,
 ) -> str:
-    """Build the user prompt with verified Quran candidates."""
+    """Build the user prompt with verified Quran candidates and rolling context."""
     target_language = LANG_NAMES.get(target_lang, target_lang)
     
-    # For now, we don't have rolling context (will add later if needed)
     user_text = f"# Current Arabic Segment\n{current_arabic}\n\n"
+    
+    # Add rolling Arabic context if available
+    if rolling_context:
+        arabic_history = rolling_context.get_arabic_context()
+        if arabic_history:
+            user_text += "# Rolling Arabic Context (oldest to newest)\n"
+            for i, seg in enumerate(arabic_history, 1):
+                user_text += f"{i}. {seg}\n"
+            user_text += "\n"
+        
+        # Add previous translations for this language
+        translation_history = rolling_context.get_translation_context(target_lang)
+        if translation_history:
+            user_text += f"# Previous {target_language} Sentences (oldest to newest)\n"
+            for i, trans in enumerate(translation_history, 1):
+                user_text += f"{i}. {trans}\n"
+            user_text += "\n"
     
     if detections:
         user_text += "# Verified Quran matches (canonical)\n"
@@ -318,6 +368,7 @@ async def translate_text(
     quran_enabled: bool = False,
     ar_map: Optional[Dict[str, Dict]] = None,
     translations_map: Optional[Dict[str, Dict[str, str]]] = None,
+    rolling_context: Optional["RollingContext"] = None,
 ) -> str:
     """
     Translate text to target language using GPT-4.1.
@@ -331,7 +382,8 @@ async def translate_text(
         system_prompt = build_system_prompt(target_language)
         user_prompt = build_user_prompt(
             text, target_lang, detections, 
-            ar_map or {}, translations_map or {}
+            ar_map or {}, translations_map or {},
+            rolling_context=rolling_context,
         )
         
         logger.debug(f"Quran detection: {len(detections)} candidates for '{text[:50]}...'")
@@ -514,9 +566,12 @@ async def mt_ticker(
         mt_state.last_translated_text = current_text
         pair_id = buffer.pair_id
         
+        logger.info(f"[MT TICK] pair={pair_id} text_len={len(current_text)} firing for langs={output_langs}")
+        
         # Fire MT for all output languages (if not already active)
         for lang in output_langs:
             if not mt_state.active_streams.get(lang, False):
+                logger.info(f"[MT FIRE] pair={pair_id} lang={lang}")
                 task = asyncio.create_task(
                     run_mt_stream_httpx(ctx, participant, current_text, pair_id, lang, mt_state)
                 )
@@ -524,6 +579,8 @@ async def mt_ticker(
                 tasks = mt_state.tasks_by_pair.setdefault(pair_id, set())
                 tasks.add(task)
                 task.add_done_callback(lambda t, p=pair_id: _cleanup_mt_task(mt_state, p, t))
+            else:
+                logger.info(f"[MT SKIP] pair={pair_id} lang={lang} (stream already active)")
 
 
 def _cleanup_mt_task(mt_state: MTState, pair_id: int, task: asyncio.Task):
@@ -845,6 +902,9 @@ async def process_audio_track(
     mt_state = MTState()
     mt_task: Optional[asyncio.Task] = None
     
+    # Rolling context for translation continuity
+    rolling_context = RollingContext()
+    
     # Start MT ticker if enabled
     if MT_ENABLED:
         mt_task = asyncio.create_task(
@@ -867,6 +927,7 @@ async def process_audio_track(
         participant: rtc.RemoteParticipant,
         config: dict,
         mt_state: MTState,
+        rolling_context: RollingContext,
     ):
         """Publish a committed chunk, run Quran detection, translate, and queue TTS."""
         # Mark pair complete and cancel any in-flight MT streams
@@ -878,6 +939,9 @@ async def process_audio_track(
             logger.debug(f"[MT CANCEL] Cancelled {len(tasks)} MT tasks for pair={pair_id}")
         
         await publish_complete(ctx, participant, committed, pair_id, input_lang)
+        
+        # Add committed Arabic to rolling context
+        rolling_context.add_arabic(committed)
 
         detections: List[Detection] = []
         if quran_enabled and quran_index and direct_index:
@@ -902,6 +966,7 @@ async def process_audio_track(
                     ar_map=ar_map,
                     translations=translations,
                     session_id=config.get("session_id", ""),
+                    rolling_context=rolling_context,
                 )
             )
 
@@ -1044,6 +1109,7 @@ async def process_audio_track(
                 participant,
                 config,
                 mt_state,
+                rolling_context,
             )
 
             # Rollover to next pair if there is carry text
@@ -1240,6 +1306,7 @@ async def translate_and_publish(
     ar_map: Optional[Dict[str, Dict]] = None,
     translations: Optional[Dict[str, Dict[str, str]]] = None,
     session_id: str = "",
+    rolling_context: Optional[RollingContext] = None,
 ):
     """
     Translate text to target language, publish translation, and queue TTS.
@@ -1254,8 +1321,13 @@ async def translate_and_publish(
         translation = await translate_text(
             text, target_lang, detections=detections,
             quran_enabled=quran_enabled, ar_map=ar_map or {}, 
-            translations_map=translations or {}
+            translations_map=translations or {},
+            rolling_context=rolling_context,
         )
+        
+        # Update rolling context with the new translation
+        if rolling_context:
+            rolling_context.add_translation(target_lang, translation)
         
         # Mark pair as completed by GPT (stops MT for this pair)
         if mt_state:
