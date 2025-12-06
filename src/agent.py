@@ -149,10 +149,11 @@ MAX_STT_RETRIES = 3
 STT_RETRY_DELAY = 2.0  # seconds
 
 # =============================================================================
-# MT (Machine Translation) Configuration - HuggingFace Endpoint
+# MT (Machine Translation) Configuration - Cerebras API
 # =============================================================================
-MT_ENDPOINT = "https://zhr3wzqjdk9vxlby.us-east-1.aws.endpoints.huggingface.cloud/v1/chat/completions"
-MT_API_KEY = "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"
+MT_ENDPOINT = "https://api.cerebras.ai/v1/chat/completions"
+MT_API_KEY = os.getenv("MT_API_KEY", "")
+MT_MODEL = "llama-3.3-70b"  # Cerebras model (fast inference)
 MT_ENABLED = True  # Toggle to enable MT for incomplete translations
 MT_TICK_INTERVAL = 0.2  # 200ms
 
@@ -616,7 +617,7 @@ async def run_mt_stream_httpx(
     
     prompt = f"Translate to {LANG_NAMES[lang]}. Output ONLY the translation, nothing else. Even if the text is incomplete, translate what you have.\n\n{text}"
     payload = {
-        "model": "tgi",
+        "model": MT_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.7,
         "stream": True,
